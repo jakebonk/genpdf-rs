@@ -161,6 +161,7 @@ pub mod fonts;
 pub mod render;
 pub mod style;
 
+use core::f64;
 use std::fs;
 use std::io;
 use std::path;
@@ -573,6 +574,7 @@ pub struct Document {
     conformance: Option<printpdf::PdfConformance>,
     creation_date: Option<printpdf::OffsetDateTime>,
     modification_date: Option<printpdf::OffsetDateTime>,
+    shrink_to_fit: Option<bool>,
 }
 
 impl Document {
@@ -589,6 +591,7 @@ impl Document {
             conformance: None,
             creation_date: None,
             modification_date: None,
+            shrink_to_fit: None,
         }
     }
 
@@ -654,6 +657,14 @@ impl Document {
         self.paper_size = paper_size.into();
     }
 
+    /// Sets the size to shrink to fit.
+    ///
+    /// If this method is not called it will default to the paper size
+    ///    
+    pub fn set_shrink_to_fit(&mut self, shrink_to_fit: bool) {
+        self.shrink_to_fit = Some(shrink_to_fit);
+    }
+
     /// Sets the page decorator for this document.
     ///
     /// The page decorator is called for every page before it is filled with the document content.
@@ -705,16 +716,24 @@ impl Document {
     /// [`render_to_file`]: #method.render_to_file
     pub fn push<E: elements::IntoBoxedElement>(&mut self, element: E) {
         self.root.push(element);
-    }
+    }    
 
     /// Renders this document into a PDF file and writes it to the given writer.
     ///
     /// The given writer is always wrapped in a buffered writer.  For details on the rendering
     /// process, see the [Rendering Process section of the crate
     /// documentation](index.html#rendering-process).
-    pub fn render(mut self, w: impl io::Write) -> Result<(), error::Error> {
+    pub fn render(mut self, w: impl io::Write) -> Result<Size, error::Error> {        
+        let res = self.build_render().unwrap();     
+        let renderer = res.0;         
+        renderer.write(w);
+        Ok(res.1)
+    }
+
+    // Helps with rendering to a renderer and returning the size of the rendered document
+    fn build_render(&mut self)->Result<(render::Renderer,Size),error::Error>{
         let mut renderer = render::Renderer::new(self.paper_size, &self.title)?;
-        if let Some(conformance) = self.conformance {
+        if let Some(conformance) = self.conformance.clone() {
             renderer = renderer.with_conformance(conformance);
         }
         if let Some(creation_date) = self.creation_date {
@@ -723,26 +742,32 @@ impl Document {
         if let Some(modification_date) = self.modification_date {
             renderer = renderer.with_modification_date(modification_date);
         }
-        self.context.font_cache.load_pdf_fonts(&renderer)?;
+        self.context.font_cache.load_pdf_fonts(&renderer)?;        
+        let mut wrap_height:f64 = 0.0;        
         loop {
-            let mut area = renderer.last_page().last_layer().area();
+            let mut area = renderer.last_page().last_layer().area();            
             if let Some(decorator) = &mut self.decorator {
                 area = decorator.decorate_page(&self.context, area, self.style)?;
             }
-            let result = self.root.render(&self.context, area, self.style)?;
+            let result = self.root.render(&self.context, area, self.style)?;            
+            wrap_height += result.size.height.0;
             if result.has_more {
                 if result.size == Size::new(0, 0) {
                     return Err(error::Error::new(
                         "Could not fit an element on a new page",
                         error::ErrorKind::PageSizeExceeded,
                     ));
-                }
-                renderer.add_page(self.paper_size);
+                }                
+                renderer.add_page(self.paper_size);                
             } else {
                 break;
             }
         }
-        renderer.write(w)
+        let mut update_size = self.paper_size;
+        if self.shrink_to_fit.unwrap_or(false) {                             
+            update_size = Size::new(self.paper_size.width, wrap_height);
+        }
+        Ok((renderer,update_size))
     }
 
     /// Renders this document into a PDF file at the given path.
@@ -751,7 +776,7 @@ impl Document {
     ///
     /// For details on the rendering process, see the [Rendering Process section of the crate
     /// documentation](index.html#rendering-process).
-    pub fn render_to_file(self, path: impl AsRef<path::Path>) -> Result<(), error::Error> {
+    pub fn render_to_file(self, path: impl AsRef<path::Path>) -> Result<Size, error::Error> {
         let path = path.as_ref();
         let file = fs::File::create(path)
             .with_context(|| format!("Could not create file {}", path.display()))?;
